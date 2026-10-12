@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "glancekit"
+version = "0.1.0"
+description = "Utilities for single-cell and spatial proteomics data processing"
+requires-python = ">=3.10"
+dependencies = [
+    "anndata==0.11.4",
+    "numpy==2.1.2",
+    "pandas==2.3.3",
+    "requests==2.32.5",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["glancekit", "glancekit.*"]
