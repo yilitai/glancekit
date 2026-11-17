@@ -1,104 +1,154 @@
-"""AnnData integration for UniProt identifier mapping.
+"""Apply validated UniProt annotations to AnnData variable metadata."""
 
-Development note
-----------------
-Portions of this module were created or refined with LLM-assisted code
-generation and review. Final integration and validation remain the
-responsibility of the package authors.
-"""
+# Portions of this file were refined with LLM assistance.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
+
+from ._logging import notebook_verbose
 from ._types import NameType
-from ._utils import deduplicate_names, is_uniprot_id
-from .client import fetch_uniprot_names
+from ._utils import deduplicate_names
+from .client import _map_names
 from .groups import fetch_uniprot_names_grouped
 
+if TYPE_CHECKING:
+    from anndata import AnnData
 
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
+
+
+@notebook_verbose
 def rename_var_names(
-    adata,
+    adata: AnnData,
     name_type: NameType = "gene",
     grouped: bool = False,
     group_sep: str = ";",
     store_original_key: str | None = "uniprot_id",
     deduplicate: bool = True,
+    *,
+    name_overrides: Mapping[str, str] | None = None,
+    verbose: bool | None = None,
+    progress: bool = True,
     **kwargs,
-) -> dict:
-    """Resolve ``adata.var_names`` from UniProt IDs and update them in place.
+) -> dict[str, str]:
+    """Rename ``adata.var_names`` using UniProtKB annotations, in place.
 
-    In grouped mode, two provenance columns are added to ``adata.var``:
-    ``is_ambiguous_group`` and ``distinct_genes_in_group``. The original IDs can
-    also be retained in ``adata.var[store_original_key]``.
+    Parameters
+    ----------
+    adata : anndata.AnnData
+        AnnData with UniProt identifiers in ``var['uniprot_id']`` (preferred)
+        or, if absent, in ``var_names``.
+    name_type : {'gene', 'gene_symbol', 'full_name'}, default='gene'
+        Gene name, uppercase gene symbol, or protein full name.
+    grouped : bool, default=False
+        Interpret each source identifier as a protein group separated by
+        ``group_sep``. Does not aggregate any abundance values.
+    group_sep : str, default=';'
+        Literal protein-group accession separator.
+    store_original_key : str or None, default='uniprot_id'
+        Where to store source IDs on the first successful mapping; ``None``
+        disables storing but does not disable reading an existing
+        ``var['uniprot_id']`` column.
+    deduplicate : bool, default=True
+        Generate collision-free unique variable names with numeric suffixes.
+    name_overrides : mapping of str to str, optional
+        Validated individual accession-to-name choices.
+    verbose : bool or None, default=None
+        Emit detailed INFO messages. The default enables messages when
+        tqdm is unavailable and suppresses them when tqdm is available.
+    progress : bool, default=True
+        Display a batch progress bar when tqdm is available. This option
+        controls the progress bar independently of ``verbose``.
+    **kwargs
+        Forwarded query options: ``group_strategy`` and ``name_join`` when
+        grouped, and ``batch_size``, ``max_workers``, ``timeout``, ``retry``,
+        ``network_retry_delay``, and ``max_network_retries`` for either mode.
+
+    Returns
+    -------
+    dict
+        Mapping from each original ID or group to its selected annotation.
+
+    Raises
+    ------
+    ValueError
+        Invalid input column, parameters, or override specification.
+    UniProtRequestError
+        Network requests exhausted bounded retries.
+    UniProtResponseError
+        Unexpected API response data.
+    UniProtAmbiguityError
+        Accession matches multiple current entries without a valid override.
 
     Notes
     -----
-    Network retries happen inside a single mapping call. Re-running this
-    function on an already-renamed object is not a safe retry strategy because
-    the original protein-group structure has already been replaced.
+    Repeated calls always prefer the original ``var['uniprot_id']`` when
+    present; switching ``name_type`` is safe. Querying and transformation
+    occur before any mutation. All known mapping columns are updated or
+    removed to match this call. On API or validation errors the original
+    AnnData remains unchanged.
     """
-    ids = list(adata.var_names)
-
-    if store_original_key is not None:
-        adata.var[store_original_key] = ids
+    if "uniprot_id" in adata.var.columns:
+        source = list(adata.var["uniprot_id"])
+    else:
+        source = list(adata.var_names)
+    bad = [(index, value) for index, value in enumerate(source)
+           if not isinstance(value, str) or not value.strip()]
+    if bad:
+        raise ValueError(f"Invalid UniProt identifiers at adata.var rows: {bad[:20]}"
+                         + (f" (and {len(bad)-20} more)" if len(bad) > 20 else ""))
+    if store_original_key is not None and (not isinstance(store_original_key, str) or not store_original_key):
+        raise ValueError("store_original_key must be a nonempty string or None")
+    managed = {"resolved", "is_ambiguous_group", "distinct_genes_in_group"}
+    if store_original_key in managed:
+        raise ValueError("store_original_key conflicts with a managed annotation column")
 
     if grouped:
-        mapping, diagnostics = fetch_uniprot_names_grouped(
-            ids,
-            name_type=name_type,
-            group_sep=group_sep,
-            return_diagnostics=True,
-            **kwargs,
+        mapping, diagnostic = fetch_uniprot_names_grouped(
+            source, name_type=name_type, group_sep=group_sep,
+            return_diagnostics=True, name_overrides=name_overrides,
+            verbose=verbose, progress=progress, **kwargs,
         )
-        adata.var["is_ambiguous_group"] = [
-            diagnostics[identifier]["is_ambiguous"] for identifier in ids
-        ]
-        adata.var["distinct_genes_in_group"] = [
-            ";".join(diagnostics[identifier]["distinct_genes"])
-            for identifier in ids
-        ]
+        resolved = [diagnostic[uid]["n_resolved"] > 0 for uid in source]
+        extra = {
+            "is_ambiguous_group": [diagnostic[uid]["is_ambiguous"] for uid in source],
+            "distinct_genes_in_group": [";".join(diagnostic[uid]["distinct_genes"]) for uid in source],
+        }
     else:
-        mapping = fetch_uniprot_names(ids, name_type=name_type, **kwargs)
+        if "group_strategy" in kwargs or "name_join" in kwargs:
+            raise ValueError("group_strategy and name_join require grouped=True")
+        names, flags = _map_names(
+            source, name_type=name_type, name_overrides=name_overrides,
+            verbose=verbose, progress=progress, **kwargs,
+        )
+        mapping = {uid: names[uid] if flags[uid] else uid for uid in source}
+        resolved = [flags[uid] for uid in source]
+        extra = {}
 
-    new_names = [mapping.get(identifier, identifier) for identifier in ids]
+    names = [mapping[uid] for uid in source]
     if deduplicate:
-        new_names = deduplicate_names(new_names)
+        names = deduplicate_names(names)
 
-    if grouped:
-        adata.var["resolved"] = [
-            new != original for original, new in zip(ids, new_names)
-        ]
-    else:
-        adata.var["resolved"] = [
-            not (is_uniprot_id(original) and new == original)
-            for original, new in zip(ids, new_names)
-        ]
+    # Stage the complete var frame, including deletion of stale grouped fields,
+    # before committing anything to the supplied AnnData.
+    staged = adata.var.copy(deep=True)
+    for column in managed:
+        if column in staged.columns:
+            staged = staged.drop(columns=column)
+    if store_original_key is not None and store_original_key not in staged.columns:
+        staged[store_original_key] = source
+    staged["resolved"] = resolved
+    for column, values in extra.items():
+        staged[column] = values
+    staged.index = names
 
-    adata.var_names = new_names
-
-    n_resolved = int(adata.var["resolved"].sum())
-    n_total = len(ids)
-    print(
-        f"\n[glancekit.uniprot] var_names updated: {n_resolved} / {n_total} resolved.\n"
-        "  Filter resolved only:\n"
-        "    adata[:, adata.var['resolved']].copy()"
-    )
-
-    if grouped:
-        n_ambiguous = int(adata.var["is_ambiguous_group"].sum())
-        if n_ambiguous:
-            print(
-                f"  {n_ambiguous} / {n_total} rows are ambiguous protein groups:\n"
-                "    adata[:, ~adata.var['is_ambiguous_group']].copy()"
-            )
-
-    if n_total - n_resolved > 0:
-        unresolved = [
-            original
-            for original, resolved in zip(ids, adata.var["resolved"])
-            if not resolved
-        ]
-        print(f"\n  Unresolved var_names ({len(unresolved)}):")
-        for name in unresolved:
-            print(f"    {name}")
-
+    # AnnData var.index is var_names. A single assignment commits both the
+    # names and annotation columns, with no partially written intermediate.
+    adata.var = staged
+    if verbose:
+        logger.info("Updated %d / %d AnnData variable names", sum(resolved), len(source))
     return mapping

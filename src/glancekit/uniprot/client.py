@@ -1,292 +1,405 @@
-"""UniProt REST client and single-accession mapping.
+"""Resolve UniProtKB accessions through batched REST API queries.
 
-A key design invariant is that an unreachable UniProt request is not treated as
-biological evidence that an accession is absent. Fast per-request retries and
-slower whole-round network retries are therefore handled separately.
-
-Development note
-----------------
-Portions of this module were created or refined with LLM-assisted code
-generation and review. Final integration and validation remain the
-responsibility of the package authors.
+The resolver follows pagination, retries transient request failures, and
+reports accession ambiguity separately from missing annotations.
 """
+
+# Portions of this file were refined with LLM assistance.
 
 from __future__ import annotations
 
+import logging
 import time
+from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
 
 import numpy as np
 import requests
 
+from ._exceptions import (
+    UniProtAmbiguityError,
+    UniProtRequestError,
+    UniProtResponseError,
+)
+from ._logging import notebook_verbose
+from ._progress import batch_progress
 from ._types import NameType
 from ._utils import is_uniprot_id, strip_isoform
 
-_UNIPROT_SEARCH_URL = "https://rest.uniprot.org/uniprotkb/search"
-_UNIPROT_FIELDS = "accession,gene_names,protein_name"
-_USER_AGENT = "Python/requests glancekit-uniprot"
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
+_SEARCH_URL = "https://rest.uniprot.org/uniprotkb/search"
+
+
+def _extract_name(entry: dict, name_type: NameType) -> str | None:
+    """Extract the requested annotation from a validated UniProtKB record."""
+    if name_type in ("gene", "gene_symbol"):
+        genes = entry.get("genes", [])
+        if not isinstance(genes, list):
+            raise UniProtResponseError("Malformed UniProt genes field")
+        name = None
+        for gene in genes:
+            if not isinstance(gene, dict):
+                raise UniProtResponseError("Malformed UniProt gene record")
+            primary = gene.get("geneName") or {}
+            if not isinstance(primary, dict):
+                raise UniProtResponseError("Malformed UniProt geneName field")
+            if primary.get("value"):
+                name = primary["value"]
+                break
+        if name is None:
+            # Use alternative gene names only when no primary name is present.
+            for gene in genes:
+                for key in ("orderedLocusNames", "orfNames", "synonyms"):
+                    values = gene.get(key) or []
+                    if not isinstance(values, list):
+                        raise UniProtResponseError(f"Malformed UniProt {key} field")
+                    if values and isinstance(values[0], dict) and values[0].get("value"):
+                        name = values[0]["value"]
+                        break
+                if name:
+                    break
+        if name is None:
+            return None
+        if not isinstance(name, str):
+            raise UniProtResponseError("UniProt returned a non-string gene name")
+        return name.upper() if name_type == "gene_symbol" else name
+
+    if name_type == "full_name":
+        description = entry.get("proteinDescription") or {}
+        if not isinstance(description, dict):
+            raise UniProtResponseError("Malformed UniProt proteinDescription field")
+        recommended = description.get("recommendedName") or {}
+        if not isinstance(recommended, dict):
+            raise UniProtResponseError("Malformed UniProt recommendedName field")
+        full = recommended.get("fullName") or {}
+        if not isinstance(full, dict):
+            raise UniProtResponseError("Malformed UniProt fullName field")
+        name = full.get("value")
+        if name is None:
+            submitted = description.get("submissionNames") or []
+            if not isinstance(submitted, list):
+                raise UniProtResponseError("Malformed UniProt submissionNames field")
+            if submitted:
+                item = submitted[0]
+                if not isinstance(item, dict) or not isinstance(item.get("fullName"), dict):
+                    raise UniProtResponseError("Malformed UniProt submitted protein name")
+                name = item["fullName"].get("value")
+        if name is not None and not isinstance(name, str):
+            raise UniProtResponseError("UniProt returned a non-string protein name")
+        return name
+    raise ValueError(f"Unsupported name_type: {name_type!r}")
+
+
+def _next_link(header: str | None) -> str | None:
+    """Extract and validate the next-page URL from a REST Link header."""
+    if not header:
+        return None
+    for part in header.split(","):
+        sections = part.strip().split(";")
+        if any(section.strip().replace('"', '') == 'rel=next' for section in sections[1:]):
+            value = sections[0].strip()
+            if value.startswith("<") and value.endswith(">"):
+                link = value[1:-1]
+                parsed = urlparse(link)
+                if parsed.scheme == "https" and parsed.hostname == "rest.uniprot.org" and parsed.path.startswith("/uniprotkb/search"):
+                    return link
+                raise UniProtResponseError("Unexpected UniProt pagination URL")
+    return None
 
 
 class _BatchResolver:
-    """Resolve clean UniProt accessions using concurrent batched requests.
-
-    ``retry``/``retry_delay`` handle transient failure of one request. A batch
-    that still never receives a response is returned to :meth:`resolve` as a
-    network failure and retried in later rounds controlled by
-    ``network_retry_delay`` and ``max_network_retries``.
-    """
+    """Query exact primary and secondary accessions with bounded network retries."""
 
     def __init__(
         self,
-        name_type: NameType,
-        batch_size: int = 50,
-        max_workers: int = 8,
-        timeout: int = 15,
-        retry: int = 3,
-        retry_delay: float = 1.0,
-        network_retry_delay: float = 10.0,
-        max_network_retries: int | None = 10,
-        verbose: bool = True,
-    ):
-        if batch_size <= 0:
-            raise ValueError("batch_size must be > 0.")
-        if max_workers <= 0:
-            raise ValueError("max_workers must be > 0.")
-        if timeout <= 0:
-            raise ValueError("timeout must be > 0.")
-        if retry <= 0:
-            raise ValueError("retry must be > 0.")
-        if network_retry_delay < 0:
-            raise ValueError("network_retry_delay must be >= 0.")
-        if max_network_retries is not None and max_network_retries <= 0:
-            raise ValueError("max_network_retries must be > 0 or None.")
-
-        self.name_type = name_type
+        *,
+        batch_size: int,
+        max_workers: int,
+        timeout: float,
+        retry: int,
+        network_retry_delay: float,
+        max_network_retries: int,
+        verbose: bool,
+        progress: bool,
+    ) -> None:
+        """Validate request limits and retain the execution settings."""
+        if batch_size <= 0 or batch_size > 500:
+            raise ValueError("batch_size must be in [1, 500]")
+        if max_workers <= 0 or timeout <= 0 or retry <= 0:
+            raise ValueError("max_workers, timeout and retry must be positive")
+        if max_network_retries <= 0 or network_retry_delay < 0:
+            raise ValueError("max_network_retries must be positive and network_retry_delay nonnegative")
         self.batch_size = batch_size
         self.max_workers = max_workers
         self.timeout = timeout
         self.retry = retry
-        self.retry_delay = retry_delay
         self.network_retry_delay = network_retry_delay
         self.max_network_retries = max_network_retries
         self.verbose = verbose
+        self.progress = progress
 
-    def _log(self, message: str) -> None:
-        if self.verbose:
-            print(message)
-
-    def _fetch_one_batch(self, batch: list[str]) -> tuple[dict[str, str], bool]:
-        """Query one batch and return ``(resolved, request_succeeded)``."""
-        query = " OR ".join(f"accession:{uid}" for uid in batch)
-        params = {
-            "query": query,
-            "fields": _UNIPROT_FIELDS,
-            "format": "json",
-            "size": len(batch) + 5,
-        }
-        headers = {"User-Agent": _USER_AGENT, "Accept": "application/json"}
-
-        for attempt in range(self.retry):
-            try:
-                response = requests.get(
-                    _UNIPROT_SEARCH_URL,
-                    params=params,
-                    headers=headers,
-                    timeout=self.timeout,
-                )
-                response.raise_for_status()
-                results = response.json().get("results", [])
-                resolved = {
-                    entry["primaryAccession"]: name
-                    for entry in results
-                    if (name := self._extract_name(entry))
-                    and entry.get("primaryAccession")
-                }
-                return resolved, True
-            except requests.exceptions.RequestException as exc:
-                if attempt < self.retry - 1:
-                    time.sleep(self.retry_delay * (attempt + 1))
-                    continue
-                self._log(
-                    "[glancekit.uniprot] WARNING: batch failed after "
-                    f"{self.retry} quick attempts because of a network error: {exc}"
-                )
-                return {}, False
-
-        return {}, False
-
-    def _extract_name(self, entry: dict) -> str | None:
-        if self.name_type in ("gene", "gene_symbol"):
-            name = self._extract_gene_name(entry)
-            if name is not None and self.name_type == "gene_symbol":
-                name = name.upper()
-            return name
-        if self.name_type == "full_name":
-            return self._extract_full_name(entry)
-        raise ValueError(
-            "name_type must be one of 'gene', 'gene_symbol', or 'full_name'."
-        )
-
-    @staticmethod
-    def _extract_gene_name(entry: dict) -> str | None:
-        genes = entry.get("genes", [])
-        for gene in genes:
-            value = gene.get("geneName", {}).get("value")
-            if value:
-                return value
-
-        for gene in genes:
-            for key in ("orderedLocusNames", "orfNames", "synonyms"):
-                values = gene.get(key, [])
-                if values:
-                    return values[0].get("value")
-        return None
-
-    @staticmethod
-    def _extract_full_name(entry: dict) -> str | None:
-        description = entry.get("proteinDescription", {})
-        name = description.get("recommendedName", {}).get("fullName", {}).get("value")
-        if name is not None:
-            return name
-        submitted = description.get("submissionNames", [])
-        if submitted:
-            return submitted[0].get("fullName", {}).get("value")
-        return None
-
-    def resolve(self, accessions: list[str]) -> dict[str, str]:
-        """Resolve accessions while retrying network failures independently."""
-        total = len(accessions)
-        if total == 0:
-            return {}
-
-        pending = list(accessions)
-        resolved: dict[str, str] = {}
-        round_num = 0
-
-        while pending:
-            round_num += 1
-            batches = [
-                pending[i : i + self.batch_size]
-                for i in range(0, len(pending), self.batch_size)
-            ]
-            if round_num == 1:
-                self._log(
-                    f"[glancekit.uniprot] {total} accessions -> {len(batches)} batches, "
-                    f"{self.max_workers} concurrent workers"
-                )
-            else:
-                self._log(
-                    f"[glancekit.uniprot] retry round {round_num}: re-querying "
-                    f"{len(pending)} accession(s) after network failure"
-                )
-
-            completed = 0
-            network_failed: list[str] = []
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                futures = {
-                    executor.submit(self._fetch_one_batch, batch): batch
-                    for batch in batches
-                }
-                for future in as_completed(futures):
-                    batch = futures[future]
-                    batch_resolved, request_succeeded = future.result()
-                    resolved.update(batch_resolved)
-                    if not request_succeeded:
-                        network_failed.extend(batch)
-                    completed += len(batch)
-                    self._log(
-                        f"[glancekit.uniprot] {min(completed, len(pending))} / "
-                        f"{len(pending)} queried this round; "
-                        f"{len(resolved)} / {total} resolved so far"
+    def _request_batch(self, batch: list[str]) -> list[dict]:
+        """Retrieve all pages for one batch and validate their record structure."""
+        # Include exact matches against both primary and secondary accessions.
+        query = " OR ".join(f"(accession:{uid} OR sec_acc:{uid})" for uid in batch)
+        params = {"query": query, "format": "json", "size": min(500, len(batch) * 2 + 5)}
+        # Full records retain the aliases needed to identify the requested IDs.
+        url: str | None = _SEARCH_URL
+        collected: list[dict] = []
+        visited: set[str] = set()
+        while url:
+            if url in visited:
+                raise UniProtResponseError("UniProt pagination loop detected")
+            visited.add(url)
+            response = None
+            for attempt in range(self.retry):
+                try:
+                    response = requests.get(
+                        url,
+                        params=params if url == _SEARCH_URL else None,
+                        timeout=self.timeout,
+                        headers={"Accept": "application/json", "User-Agent": "glancekit-uniprot"},
                     )
+                    response.raise_for_status()
+                    break
+                except requests.exceptions.HTTPError as exc:
+                    status = getattr(getattr(exc, "response", None), "status_code", None)
+                    if status is None:
+                        status = getattr(response, "status_code", None)
+                    if status is not None and 400 <= status < 500 and status not in (408, 429):
+                        raise UniProtResponseError(
+                            f"UniProt rejected the query (HTTP {status}) for a batch of "
+                            f"{len(batch)} accessions starting at {batch[0]}. "
+                            "Check query syntax or reduce batch_size."
+                        ) from exc
+                    if attempt + 1 == self.retry:
+                        raise UniProtRequestError(f"UniProt request failed for {batch}: {exc}") from exc
+                    time.sleep(attempt + 1)
+                except requests.exceptions.RequestException as exc:
+                    if attempt + 1 == self.retry:
+                        raise UniProtRequestError(f"UniProt request failed for {batch}: {exc}") from exc
+                    time.sleep(attempt + 1)
+            try:
+                payload = response.json()
+            except (ValueError, TypeError) as exc:
+                raise UniProtResponseError(f"Invalid JSON for batch {batch}") from exc
+            if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+                raise UniProtResponseError(f"Malformed UniProt response for batch {batch}: missing results list")
+            for entry in payload["results"]:
+                if not isinstance(entry, dict) or not isinstance(entry.get("primaryAccession"), str):
+                    raise UniProtResponseError(f"Malformed UniProt entry in batch {batch}")
+                secondary = entry.get("secondaryAccessions", [])
+                if not isinstance(secondary, list) or not all(isinstance(item, str) for item in secondary):
+                    raise UniProtResponseError("Malformed UniProt secondaryAccessions field")
+                collected.append(entry)
+            url = _next_link(response.headers.get("Link"))
+            params = None
+        return collected
 
-            pending = network_failed
+    def resolve(self, accessions: list[str]) -> dict[str, list[dict]]:
+        """Return all matching entries for each accession; raise on failed batches."""
+        matched: dict[str, dict[str, dict]] = {uid: {} for uid in accessions}
+        pending = [accessions[i:i + self.batch_size] for i in range(0, len(accessions), self.batch_size)]
+        for round_number in range(1, self.max_network_retries + 1):
             if not pending:
                 break
-
-            if (
-                self.max_network_retries is not None
-                and round_num >= self.max_network_retries
-            ):
-                self._log(
-                    f"[glancekit.uniprot] WARNING: gave up after {round_num} round(s); "
-                    f"{len(pending)} accession(s) remain network-unreachable. "
-                    "They are not confirmed absent from UniProt: "
-                    f"{pending}"
-                )
+            failed: list[tuple[list[str], Exception]] = []
+            if self.verbose:
+                logger.info("UniProt request round %d: %d batches", round_number, len(pending))
+            with batch_progress(len(pending), round_number, self.progress) as bar:
+                with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+                    futures = {pool.submit(self._request_batch, batch): batch for batch in pending}
+                    for future in as_completed(futures):
+                        batch = futures[future]
+                        try:
+                            entries = future.result()
+                        except UniProtRequestError as exc:
+                            failed.append((batch, exc))
+                            continue
+                        finally:
+                            if bar is not None:
+                                bar.update(1)
+                        # Index each record by its matched input aliases and unique primary ID.
+                        requested = set(batch)
+                        for entry in entries:
+                            primary = entry["primaryAccession"].upper()
+                            aliases = {primary, *(value.upper() for value in entry.get("secondaryAccessions", []))}
+                            for accession in requested.intersection(aliases):
+                                matched[accession][primary] = entry
+            if not failed:
                 break
-
-            self._log(
-                f"[glancekit.uniprot] {len(pending)} accession(s) still failed because "
-                f"of network errors; sleeping {self.network_retry_delay}s before retrying."
-            )
+            if round_number == self.max_network_retries:
+                failed_ids = [uid for batch, _ in failed for uid in batch]
+                raise UniProtRequestError(
+                    f"UniProt requests failed after {round_number} round(s); "
+                    f"network-unreachable accessions: {failed_ids}. "
+                    f"Example: {failed[0][1]}"
+                )
+            pending = [batch for batch, _ in failed]
             time.sleep(self.network_retry_delay)
+        return {uid: list(entries.values()) for uid, entries in matched.items()}
 
-        return resolved
 
-
-def fetch_uniprot_names(
-    uniprot_ids,
+def _map_names(
+    uniprot_ids: Iterable[str],
+    *,
     name_type: NameType = "gene",
-    batch_size: int = 50,
+    batch_size: int = 10,
     max_workers: int = 8,
-    timeout: int = 15,
+    timeout: float = 15,
     retry: int = 3,
-    network_retry_delay: float = 10.0,
-    max_network_retries: int | None = 10,
-    fallback_to_id: bool = True,
-    verbose: bool = True,
-) -> dict:
-    """Map standalone UniProt accessions to gene or protein names.
+    network_retry_delay: float = 5.0,
+    max_network_retries: int = 3,
+    name_overrides: Mapping[str, str] | None = None,
+    verbose: bool = False,
+    progress: bool = True,
+) -> tuple[dict[str, str | None], dict[str, bool]]:
+    """Return names and resolution flags keyed by the original identifiers.
 
-    Network failures are retried separately from UniProt-confirmed missing
-    entries. When ``fallback_to_id`` is true, unresolved accessions retain the
-    original identifier; otherwise their mapping value is ``numpy.nan``.
+    Isoform suffixes and letter case are normalized for lookup. Overrides
+    are validated against names returned by UniProtKB for the requested
+    annotation type. A completed query may yield no annotation.
     """
-    raw_ids = list(uniprot_ids)
-    clean_ids = [strip_isoform(uid) for uid in raw_ids]
-    accessions = list(dict.fromkeys(uid for uid in clean_ids if is_uniprot_id(uid)))
+    if name_type not in ("gene", "gene_symbol", "full_name"):
+        raise ValueError(f"Invalid name_type: {name_type!r}")
+    raw = list(uniprot_ids)
+    if not all(isinstance(uid, str) for uid in raw):
+        raise ValueError("Every UniProt identifier must be a string")
+    cleaned = [strip_isoform(uid).upper() for uid in raw]
+    overrides = dict(name_overrides or {})
+    if not all(isinstance(k, str) and isinstance(v, str) and v.strip() for k, v in overrides.items()):
+        raise ValueError("name_overrides must map accession strings to nonempty name strings")
+    override_by_base: dict[str, str] = {}
+    for key, value in overrides.items():
+        base = strip_isoform(key).upper()
+        if not is_uniprot_id(base):
+            raise ValueError(f"Invalid accession in name_overrides: {key!r}")
+        if base in override_by_base and override_by_base[base] != value:
+            raise ValueError(f"Conflicting name_overrides for {base}")
+        override_by_base[base] = value
+    valid = list(dict.fromkeys(uid for uid in cleaned if is_uniprot_id(uid)))
+    unused = set(override_by_base) - set(valid)
+    if unused:
+        raise ValueError(f"name_overrides contains accessions absent from input: {sorted(unused)}")
+    candidates = _BatchResolver(
+        batch_size=batch_size, max_workers=max_workers, timeout=timeout, retry=retry,
+        network_retry_delay=network_retry_delay, max_network_retries=max_network_retries,
+        verbose=verbose, progress=progress,
+    ).resolve(valid)
+    ambiguity: list[str] = []
+    invalid_override: list[str] = []
+    chosen: dict[str, str | None] = {}
+    for uid in valid:
+        entries = candidates[uid]
+        annotations = [(entry["primaryAccession"], _extract_name(entry, name_type)) for entry in entries]
+        # Ambiguity is determined by distinct primary accessions.
+        if uid in override_by_base:
+            selected = override_by_base[uid]
+            if selected not in {name for _, name in annotations if name is not None}:
+                invalid_override.append(f"{uid}: requested {selected!r}; candidates {annotations}")
+            else:
+                chosen[uid] = selected
+        elif len(entries) > 1:
+            ambiguity.append(f"{uid}: {annotations}")
+        elif annotations:
+            chosen[uid] = annotations[0][1]
+        else:
+            chosen[uid] = None
+    if ambiguity or invalid_override:
+        messages = []
+        if ambiguity:
+            messages.append("Ambiguous UniProt accessions (provide name_overrides):\n  " + "\n  ".join(sorted(ambiguity)))
+        if invalid_override:
+            messages.append("Invalid name_overrides:\n  " + "\n  ".join(sorted(invalid_override)))
+        raise UniProtAmbiguityError("\n".join(messages))
+    result = {original: chosen.get(clean) for original, clean in zip(raw, cleaned)}
+    flags = {original: chosen.get(clean) is not None for original, clean in zip(raw, cleaned)}
+    if verbose:
+        logger.info("Resolved %d / %d accessions", sum(flags.values()), len(raw))
+        missing = [uid for uid, found in flags.items() if not found]
+        if missing:
+            logger.info("Unresolved accessions: %s", missing)
+    return result, flags
 
-    n_skipped = sum(not is_uniprot_id(uid) for uid in clean_ids)
-    if n_skipped and verbose:
-        print(
-            f"[glancekit.uniprot] {n_skipped} entrie(s) are not UniProt accessions; "
-            "they will be returned unchanged."
-        )
 
-    resolver = _BatchResolver(
-        name_type=name_type,
-        batch_size=batch_size,
-        max_workers=max_workers,
-        timeout=timeout,
-        retry=retry,
+@notebook_verbose
+def fetch_uniprot_names(
+    uniprot_ids: Iterable[str],
+    name_type: NameType = "gene",
+    batch_size: int = 10,
+    max_workers: int = 8,
+    timeout: float = 15,
+    retry: int = 3,
+    network_retry_delay: float = 5.0,
+    max_network_retries: int = 3,
+    fallback_to_id: bool = True,
+    verbose: bool | None = None,
+    progress: bool = True,
+    name_overrides: Mapping[str, str] | None = None,
+) -> dict[str, str | float]:
+    """Resolve UniProtKB accessions to annotation names.
+
+    Parameters
+    ----------
+    uniprot_ids : iterable of str
+        Original UniProtKB accessions, with optional numeric isoform suffixes.
+        Strings not resembling accessions remain unresolved.
+    name_type : {'gene', 'gene_symbol', 'full_name'}, default='gene'
+        Primary gene name, uppercase gene name, or full protein name.
+    batch_size : int, default=10
+        Maximum accessions per query (up to 500).
+    max_workers : int, default=8
+        Concurrent API requests.
+    timeout : float, default=15
+        Requests connection/read timeout in seconds; not an overall deadline.
+    retry : int, default=3
+        Attempts per HTTP request.
+    network_retry_delay : float, default=5
+        Wait between rounds of failed batches, in seconds.
+    max_network_retries : int, default=3
+        Total number of rounds, including the first.
+    fallback_to_id : bool, default=True
+        Return the original accession for a legitimate unresolved query;
+        otherwise return ``numpy.nan``.
+    verbose : bool or None, default=None
+        Emit detailed INFO messages. The default enables messages when
+        tqdm is unavailable and suppresses them when tqdm is available.
+    progress : bool, default=True
+        Display a batch progress bar when tqdm is available. This option
+        controls the progress bar independently of ``verbose``.
+    name_overrides : mapping of str to str, optional
+        Requested accession-to-name choices, validated against actual UniProt
+        candidates for the current ``name_type``. Never bypasses API queries.
+
+    Returns
+    -------
+    dict
+        Mapping from each original accession to a name or fallback value.
+
+    Raises
+    ------
+    UniProtRequestError
+        An HTTP request failed after bounded retries; no partial map returned.
+    UniProtResponseError
+        UniProt returned invalid or structurally unexpected content.
+    UniProtAmbiguityError
+        A requested accession matched multiple current UniProtKB entries or a
+        name override does not match any candidate. All candidates are listed.
+    ValueError
+        Invalid arguments or override keys/values.
+
+    Notes
+    -----
+    Network errors are never treated as legitimate missing records.
+    """
+    names, _ = _map_names(
+        uniprot_ids, name_type=name_type, batch_size=batch_size,
+        max_workers=max_workers, timeout=timeout, retry=retry,
         network_retry_delay=network_retry_delay,
         max_network_retries=max_network_retries,
-        verbose=verbose,
+        name_overrides=name_overrides, verbose=verbose, progress=progress,
     )
-    resolved = resolver.resolve(accessions)
-
-    mapping: dict = {}
-    unresolved: list[str] = []
-    for raw, clean in zip(raw_ids, clean_ids):
-        if not is_uniprot_id(clean):
-            mapping[raw] = raw
-            continue
-        name = resolved.get(clean)
-        if name is None:
-            unresolved.append(raw)
-            mapping[raw] = raw if fallback_to_id else np.nan
-        else:
-            mapping[raw] = name
-
-    if unresolved and verbose:
-        print(
-            f"\n[glancekit.uniprot] WARNING: {len(unresolved)} accession(s) could not "
-            "be resolved. This can reflect a merged/deleted accession, an entry without "
-            "the requested name field, or persistent network failure.\n"
-            "  Unresolved list:"
-        )
-        for uid in unresolved:
-            print(f"    {uid}")
-
-    return mapping
+    return {uid: value if value is not None else (uid if fallback_to_id else np.nan)
+            for uid, value in names.items()}

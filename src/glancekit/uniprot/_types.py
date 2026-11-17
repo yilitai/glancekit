@@ -1,13 +1,11 @@
-"""Shared typing aliases for UniProt mapping utilities.
+"""Shared types for UniProt annotations."""
 
-Development note
-----------------
-Portions of this module were created or refined with LLM-assisted code
-generation and review. Final integration and validation remain the
-responsibility of the package authors.
-"""
+# Portions of this file were refined with LLM assistance.
 
 from typing import Literal
 
+# Supported annotations returned for a resolved UniProtKB entry.
 NameType = Literal["gene", "gene_symbol", "full_name"]
+
+# Rules for combining resolved annotations within a protein group.
 GroupStrategy = Literal["first", "all", "majority"]
