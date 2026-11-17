@@ -3,6 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
+name = "glancekit"
+version = "0.2.0"
+description = "Utilities for single-cell and spatial proteomics data processing"
 requires-python = ">=3.10"
 
 dependencies = [
