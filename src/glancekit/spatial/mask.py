@@ -42,6 +42,17 @@ def _image_rows(values: pd.Series, image_id: str | int) -> tuple[np.ndarray, str
     return rows, key
 
 
+def _select_mask_rows(
+    adata: AnnData, image_col: str | None, image_id: str | int | None
+) -> tuple[np.ndarray, str | None]:
+    """Select all observations for a single section or the rows of a named image."""
+    if image_col is None or image_id is None:
+        if image_col is not None or image_id is not None:
+            raise ValueError("Provide both image_col and image_id, or omit both for a single section.")
+        return np.arange(adata.n_obs, dtype=np.intp), None
+    return _image_rows(adata.obs[image_col], image_id)
+
+
 def _read_label_mask(path: Path) -> np.ndarray:
     """Read a single 2D TIFF series as an instance label array."""
     from tifffile import TiffFile
@@ -112,8 +123,8 @@ def assign_mask_ids(
     adata: AnnData,
     mask_path: str | Path,
     *,
-    image_col: str,
-    image_id: str | int,
+    image_col: str | None = None,
+    image_id: str | int | None = None,
     spatial_key: str = "spatial",
     key_added: str = "mask_id",
     label_col: str | None = None,
@@ -128,10 +139,12 @@ def assign_mask_ids(
     mask_path : str or pathlib.Path
         TIFF containing one nonempty, two-dimensional integer instance mask.
         Label 0 denotes background.
-    image_col : str
-        Column in ``obs`` that identifies each image.
-    image_id : str or int
-        Value in ``obs[image_col]`` identifying the image to update.
+    image_col : str or None, default=None
+        Column in ``obs`` that identifies each image. Omit both image parameters
+        to treat all observations as a single section.
+    image_id : str, int or None, default=None
+        Value in ``obs[image_col]`` identifying the image to update. Provide both
+        image parameters when assigning multiple images separately.
     spatial_key : str, default='spatial'
         Key in ``obsm`` containing zero-based (x, y) pixel coordinates in
         the TIFF frame. Used when ``label_col`` is absent.
@@ -155,9 +168,10 @@ def assign_mask_ids(
     -----
     Repeated hits to the same nonzero label are ambiguous. Unmatched cells
     receive missing values, including when no cell in the image matches.
-    Assignments for other images are retained. The TIFF's absolute path is
-    stored in ``uns["mask_paths"]``, keyed by the string form of the image
-    ID in ``obs``. Use the same image and output columns across cohort calls.
+    Assignments for other images are retained when selecting an image.
+    The TIFF's absolute path is stored in ``uns["mask_path"]`` for a single
+    section, or in ``uns["mask_paths"]`` under the string image ID when
+    selecting an image. Use the same image and output columns across cohort calls.
     """
     if adata.is_view:
         raise ValueError("Pass an AnnData object or an explicit copy of a view.")
@@ -165,7 +179,7 @@ def assign_mask_ids(
         raise ValueError("adata.obs must have unique column names.")
     if key_added in (image_col, label_col):
         raise ValueError("key_added must differ from the image and source label columns.")
-    rows, image_key = _image_rows(adata.obs[image_col], image_id)
+    rows, image_key = _select_mask_rows(adata, image_col, image_id)
     paths = dict(adata.uns.get("mask_paths", {}))
     path = Path(mask_path).expanduser().resolve(strict=True)
     mask = _read_label_mask(path)
@@ -180,7 +194,6 @@ def assign_mask_ids(
     n_matched = int(matched.sum())
     assigned = pd.array(labels, dtype="Int64")
     assigned[~matched] = pd.NA
-    paths[image_key] = str(path)
     existing = adata.obs.get(key_added)
     if existing is not None and existing.dtype == pd.Int64Dtype():
         adata.obs.iloc[rows, adata.obs.columns.get_loc(key_added)] = assigned
@@ -194,7 +207,11 @@ def assign_mask_ids(
             output[:] = pd.NA
         output[rows] = assigned
         adata.obs[key_added] = output
-    adata.uns["mask_paths"] = paths
+    if image_key is None:
+        adata.uns["mask_path"] = str(path)
+    else:
+        paths[image_key] = str(path)
+        adata.uns["mask_paths"] = paths
     return {
         "total": int(rows.size),
         "matched": n_matched,

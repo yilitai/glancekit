@@ -19,7 +19,7 @@ from matplotlib.patches import Patch
 from matplotlib.transforms import nonsingular
 from pandas.api.types import is_bool_dtype, is_numeric_dtype
 
-from .mask import _image_rows, _read_label_mask, _validate_label_mask
+from .mask import _read_label_mask, _select_mask_rows, _validate_label_mask
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -162,9 +162,9 @@ def _add_contour_outline(ax, regions, style):
 def plot_mask(
     adata: AnnData,
     *,
-    image_id: str | int,
+    image_id: str | int | None = None,
     color: str,
-    image_col: str = "ImageNumber",
+    image_col: str | None = None,
     mask_id_col: str = "mask_id",
     mask: str | Path | np.ndarray | None = None,
     layer: str | None = None,
@@ -191,19 +191,23 @@ def plot_mask(
     Parameters
     ----------
     adata : anndata.AnnData
-        AnnData containing image IDs and assigned mask labels in ``obs``.
-    image_id : str or int
-        Value in ``obs[image_col]`` identifying the image to display.
+        AnnData containing assigned mask labels in ``obs``.
+    image_id : str, int or None, default=None
+        Value in ``obs[image_col]`` identifying the image to display. Omit both
+        image parameters to display all observations as a single section.
     color : str
         Observation column or feature name. Observation columns take
         precedence unless a feature layer is specified.
-    image_col : str, default='ImageNumber'
-        Observation column identifying each image.
+    image_col : str or None, default=None
+        Observation column identifying each image. Defaults to
+        ``"ImageNumber"`` when ``image_id`` is supplied by itself.
     mask_id_col : str, default='mask_id'
         Observation column containing the original mask labels.
     mask : str, pathlib.Path, numpy.ndarray, or None, default=None
-        TIFF path or 2D integer label array. The default uses the path in
-        ``uns["mask_paths"]`` registered by ``assign_mask_ids``.
+        TIFF path or 2D integer label array. The default uses the path
+        registered by ``assign_mask_ids`` in ``uns["mask_path"]`` or
+        ``uns["mask_paths"]``. In single-section mode, an older object with
+        exactly one registered image path can also be displayed.
     layer : str or None, default=None
         Layer from which to read feature values. The default reads ``X``
         when coloring by a feature.
@@ -269,12 +273,24 @@ def plot_mask(
         raise ValueError("outline_mode must be 'pixel' or 'contour'.")
     if not adata.obs.columns.is_unique:
         raise ValueError("adata.obs must have unique column names.")
-    rows, image_key = _image_rows(adata.obs[image_col], image_id)
+    if image_id is not None and image_col is None:
+        image_col = "ImageNumber"
+    rows, image_key = _select_mask_rows(adata, image_col, image_id)
     if mask is None:
-        try:
-            mask = adata.uns["mask_paths"][image_key]
-        except KeyError as exc:
-            raise KeyError(f"No TIFF path for image {image_key!r}. Pass mask= explicitly.") from exc
+        paths = adata.uns.get("mask_paths", {})
+        if image_key is None:
+            mask = adata.uns.get("mask_path")
+            if mask is None and len(paths) == 1:
+                mask = next(iter(paths.values()))
+            if mask is None and len(paths) > 1:
+                raise ValueError("Multiple TIFF paths are registered. Select an image to display.")
+            if mask is None:
+                raise KeyError("No TIFF path for the section. Pass mask= explicitly.")
+        else:
+            try:
+                mask = paths[image_key]
+            except KeyError as exc:
+                raise KeyError(f"No TIFF path for image {image_key!r}. Pass mask= explicitly.") from exc
     if isinstance(mask, (str, Path)):
         mask = _read_label_mask(Path(mask).expanduser())
     else:
@@ -288,7 +304,8 @@ def plot_mask(
     positions = pd.Index(labels.astype(np.int64, copy=False)).get_indexer(mask_ids)
     linked = (mask_ids > 0) & (positions >= 0)
     if not pd.Index(mask_ids[linked]).is_unique:
-        raise ValueError(f"Multiple cells share a mask ID in image {image_key!r}.")
+        image = "the section" if image_key is None else f"image {image_key!r}"
+        raise ValueError(f"Multiple cells share a mask ID in {image}.")
     cell_rows, positions = rows[linked], positions[linked]
 
     if layer is None and color in adata.obs:
