@@ -42,15 +42,76 @@ def _image_rows(values: pd.Series, image_id: str | int) -> tuple[np.ndarray, str
     return rows, key
 
 
+def _mask_image_column(adata: AnnData, image_col: str | None) -> str:
+    """Resolve the image column consistently across the mask workflow."""
+    registered = adata.uns.get("mask_image_col")
+    if registered is not None and image_col is not None and image_col != registered:
+        raise ValueError(f"Mask paths are registered using image_col={registered!r}.")
+    return image_col if image_col is not None else (
+        registered if registered is not None else "ImageNumber"
+    )
+
+
 def _select_mask_rows(
     adata: AnnData, image_col: str | None, image_id: str | int | None
 ) -> tuple[np.ndarray, str | None]:
-    """Select all observations for a single section or the rows of a named image."""
-    if image_col is None or image_id is None:
-        if image_col is not None or image_id is not None:
-            raise ValueError("Provide both image_col and image_id, or omit both for a single section.")
-        return np.arange(adata.n_obs, dtype=np.intp), None
-    return _image_rows(adata.obs[image_col], image_id)
+    """Select one section; never silently combine known image groups."""
+    column = _mask_image_column(adata, image_col)
+    paths = adata.uns.get("mask_paths", {})
+    if image_id is not None:
+        return _image_rows(adata.obs[column], image_id)
+    if len(paths) > 1:
+        raise ValueError("Select one section with image_id.")
+    rows = np.arange(adata.n_obs, dtype=np.intp)
+    if column in adata.obs:
+        values = adata.obs[column]
+        if values.nunique(dropna=False) > 1:
+            raise ValueError("Select one section with image_id.")
+        if paths and len(values):
+            if values.isna().any():
+                raise ValueError("Missing image ID; select a section explicitly.")
+            selected, key = _image_rows(values, values.iloc[0])
+            if key not in paths:
+                raise ValueError("The selected section does not match the registered mask path. "
+                                 "Specify image_id explicitly.")
+            return selected, key
+    elif image_col is not None or adata.uns.get("mask_image_col") is not None:
+        raise KeyError(f"Image column {column!r} is missing from adata.obs.")
+    return rows, None
+
+
+def _resolve_section_mask(adata: AnnData, rows: np.ndarray, image_key: str | None, mask):
+    """Resolve an explicit mask or the registered path for the selected section."""
+    if mask is not None:
+        return mask
+    paths = adata.uns.get("mask_paths", {})
+    if image_key is not None:
+        mask = paths.get(image_key)
+        if mask is None and not paths and len(rows) == adata.n_obs:
+            mask = adata.uns.get("mask_path")
+    elif len(paths) == 1:
+        mask = next(iter(paths.values()))
+    else:
+        mask = adata.uns.get("mask_path")
+    if mask is None:
+        raise KeyError("No mask path is registered for the section. Pass mask explicitly.")
+    return mask
+
+
+def _invalidated_morphology(adata: AnnData, rows: np.ndarray):
+    """Prepare invalidation of default and registered derived morphology tables."""
+    keys = {"morphology", *adata.uns.get("_morphy_morphology_keys", [])}
+    updates = {}
+    for key in keys:
+        table = adata.obsm.get(key)
+        if table is None:
+            continue
+        if not isinstance(table, pd.DataFrame):
+            raise TypeError(f"adata.obsm[{key!r}] must contain a morphology DataFrame.")
+        updated = table.copy()
+        updated.iloc[rows, :] = np.nan
+        updates[key] = updated
+    return updates
 
 
 def _read_label_mask(path: Path) -> np.ndarray:
@@ -140,11 +201,11 @@ def assign_mask_ids(
         TIFF containing one nonempty, two-dimensional integer instance mask.
         Label 0 denotes background.
     image_col : str or None, default=None
-        Column in ``obs`` that identifies each image. Omit both image parameters
-        to treat all observations as a single section.
+        Column in ``obs`` that identifies each image. Defaults to the
+        registered image column, or ``"ImageNumber"`` if none is registered.
     image_id : str, int or None, default=None
-        Value in ``obs[image_col]`` identifying the image to update. Provide both
-        image parameters when assigning multiple images separately.
+        Value in ``obs[image_col]`` identifying the image to update. Required
+        when multiple sections are known; otherwise it may be omitted.
     spatial_key : str, default='spatial'
         Key in ``obsm`` containing zero-based (x, y) pixel coordinates in
         the TIFF frame. Used when ``label_col`` is absent.
@@ -172,12 +233,14 @@ def assign_mask_ids(
     The TIFF's absolute path is stored in ``uns["mask_path"]`` for a single
     section, or in ``uns["mask_paths"]`` under the string image ID when
     selecting an image. Use the same image and output columns across cohort calls.
+    Previously computed morphology for the selected rows is invalidated,
+    including custom output tables registered by linked_cell_morphology.
     """
     if adata.is_view:
         raise ValueError("Pass an AnnData object or an explicit copy of a view.")
     if not adata.obs.columns.is_unique:
         raise ValueError("adata.obs must have unique column names.")
-    if key_added in (image_col, label_col):
+    if key_added in (_mask_image_column(adata, image_col), label_col):
         raise ValueError("key_added must differ from the image and source label columns.")
     rows, image_key = _select_mask_rows(adata, image_col, image_id)
     paths = dict(adata.uns.get("mask_paths", {}))
@@ -194,6 +257,7 @@ def assign_mask_ids(
     n_matched = int(matched.sum())
     assigned = pd.array(labels, dtype="Int64")
     assigned[~matched] = pd.NA
+    invalidated = _invalidated_morphology(adata, rows)
     existing = adata.obs.get(key_added)
     if existing is not None and existing.dtype == pd.Int64Dtype():
         adata.obs.iloc[rows, adata.obs.columns.get_loc(key_added)] = assigned
@@ -212,6 +276,11 @@ def assign_mask_ids(
     else:
         paths[image_key] = str(path)
         adata.uns["mask_paths"] = paths
+        adata.uns["mask_image_col"] = _mask_image_column(adata, image_col)
+        # The named registry supersedes the old unqualified path.
+        adata.uns.pop("mask_path", None)
+    for morphology_key, table in invalidated.items():
+        adata.obsm[morphology_key] = table
     return {
         "total": int(rows.size),
         "matched": n_matched,

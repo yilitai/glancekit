@@ -19,7 +19,9 @@ from matplotlib.patches import Patch
 from matplotlib.transforms import nonsingular
 from pandas.api.types import is_bool_dtype, is_numeric_dtype
 
-from .mask import _read_label_mask, _select_mask_rows, _validate_label_mask
+from .mask import (
+    _read_label_mask, _resolve_section_mask, _select_mask_rows, _validate_label_mask,
+)
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -194,13 +196,13 @@ def plot_mask(
         AnnData containing assigned mask labels in ``obs``.
     image_id : str, int or None, default=None
         Value in ``obs[image_col]`` identifying the image to display. Omit both
-        image parameters to display all observations as a single section.
+        image parameters only when the observations belong to a single section.
     color : str
         Observation column or feature name. Observation columns take
         precedence unless a feature layer is specified.
     image_col : str or None, default=None
-        Observation column identifying each image. Defaults to
-        ``"ImageNumber"`` when ``image_id`` is supplied by itself.
+        Observation column identifying each image. Defaults to the registered
+        image column, or ``"ImageNumber"`` if none is registered.
     mask_id_col : str, default='mask_id'
         Observation column containing the original mask labels.
     mask : str, pathlib.Path, numpy.ndarray, or None, default=None
@@ -273,24 +275,8 @@ def plot_mask(
         raise ValueError("outline_mode must be 'pixel' or 'contour'.")
     if not adata.obs.columns.is_unique:
         raise ValueError("adata.obs must have unique column names.")
-    if image_id is not None and image_col is None:
-        image_col = "ImageNumber"
     rows, image_key = _select_mask_rows(adata, image_col, image_id)
-    if mask is None:
-        paths = adata.uns.get("mask_paths", {})
-        if image_key is None:
-            mask = adata.uns.get("mask_path")
-            if mask is None and len(paths) == 1:
-                mask = next(iter(paths.values()))
-            if mask is None and len(paths) > 1:
-                raise ValueError("Multiple TIFF paths are registered. Select an image to display.")
-            if mask is None:
-                raise KeyError("No TIFF path for the section. Pass mask= explicitly.")
-        else:
-            try:
-                mask = paths[image_key]
-            except KeyError as exc:
-                raise KeyError(f"No TIFF path for image {image_key!r}. Pass mask= explicitly.") from exc
+    mask = _resolve_section_mask(adata, rows, image_key, mask)
     if isinstance(mask, (str, Path)):
         mask = _read_label_mask(Path(mask).expanduser())
     else:
